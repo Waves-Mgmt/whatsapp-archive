@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import sqlite3
 import sys
@@ -513,7 +514,7 @@ def import_s3_archive(
 
 def render_direct_s3_uploader(upload_url: str, object_key: str) -> None:
     """Render a browser uploader that sends a ZIP directly to S3."""
-    safe_url = html.escape(upload_url, quote=True)
+    js_upload_url = json.dumps(upload_url)
     safe_key = html.escape(object_key, quote=True)
 
     components.html(
@@ -566,7 +567,7 @@ def render_direct_s3_uploader(upload_url: str, object_key: str) -> None:
           bar.style.width = "0%";
 
           const request = new XMLHttpRequest();
-          request.open("PUT", "{safe_url}", true);
+          request.open("PUT", {js_upload_url}, true);
           request.setRequestHeader("Content-Type", "application/zip");
           request.setRequestHeader("x-amz-server-side-encryption", "AES256");
 
