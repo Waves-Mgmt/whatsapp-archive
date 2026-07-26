@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 import sqlite3
 import sys
@@ -7,9 +8,9 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from src.s3_storage import upload_file_to_s3, verify_s3_object
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # ============================================================
@@ -32,6 +33,11 @@ from database import (  # noqa: E402
 )
 from media_manager import organize_media  # noqa: E402
 from parser import parse_whatsapp_chat  # noqa: E402
+from s3_direct_upload import (  # noqa: E402
+    create_direct_upload_url,
+    download_s3_object,
+    verify_uploaded_object,
+)
 
 
 # ============================================================
@@ -432,123 +438,59 @@ def find_chat_file(extracted_directory: Path) -> Path:
     )
 
 
-def save_uploaded_zip(
-    uploaded_file: Any,
-    destination_path: Path,
-) -> None:
-    """
-    Save the uploaded ZIP permanently to the local archive.
-    """
-    destination_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with destination_path.open("wb") as output_file:
-        output_file.write(uploaded_file.getbuffer())
-
-
-def import_uploaded_archive(
-    uploaded_file: Any,
+def import_s3_archive(
+    object_key: str,
     property_name: str,
 ) -> dict[str, Any]:
-    """
-    Save, extract, parse, import and organize one WhatsApp archive.
-    """
+    """Download a verified S3 ZIP and import its WhatsApp contents."""
     cleaned_property_name = property_name.strip()
-
     if not cleaned_property_name:
-        raise ValueError(
-            "Enter a property name before importing."
-        )
+        raise ValueError("Enter a property name before importing.")
 
-    timestamp_label = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
+    verification = verify_uploaded_object(object_key)
+    stored_size = int(verification["size_bytes"])
+    if stored_size <= 0:
+        raise RuntimeError("The S3 object exists but is empty.")
 
-    safe_property_name = sanitize_folder_name(
-        cleaned_property_name
-    )
-
-    import_directory = (
-        INCOMING_ROOT
-        / safe_property_name
-        / timestamp_label
-    )
-
+    timestamp_label = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_property_name = sanitize_folder_name(cleaned_property_name)
+    import_directory = INCOMING_ROOT / safe_property_name / timestamp_label
     original_directory = import_directory / "original"
     extracted_directory = import_directory / "extracted"
+    original_directory.mkdir(parents=True, exist_ok=True)
 
-    uploaded_filename = (
-        Path(uploaded_file.name).name
-        if uploaded_file.name
-        else "whatsapp_export.zip"
-    )
+    zip_path = original_directory / Path(object_key).name
 
-    zip_path = original_directory / uploaded_filename
-
-    # Upload the original WhatsApp ZIP to permanent AWS S3 storage first.
-    uploaded_file.seek(0)
-
-    s3_object_key = upload_file_to_s3(
-        file_object=uploaded_file,
-        filename=uploaded_filename,
-        property_name=cleaned_property_name,
-        content_type=getattr(uploaded_file, "type", None),
-    )
-
-    # Verify that AWS received the complete file.
-    s3_verification = verify_s3_object(s3_object_key)
-    expected_size = len(uploaded_file.getbuffer())
-    stored_size = int(s3_verification["ContentLength"])
-
-    if stored_size != expected_size:
-        raise RuntimeError(
-            "The AWS backup could not be verified because the uploaded "
-            "file size does not match the stored file size."
-        )
-
-    # Reset the uploaded file before saving a temporary local processing copy.
-    uploaded_file.seek(0)
-
-    save_uploaded_zip(
-        uploaded_file=uploaded_file,
+    download_s3_object(
+        object_key=object_key,
         destination_path=zip_path,
     )
 
-    safely_extract_zip(
-        zip_path=zip_path,
-        destination_directory=extracted_directory,
-    )
+    if zip_path.stat().st_size != stored_size:
+        raise RuntimeError(
+            "The downloaded ZIP size does not match the verified S3 size."
+        )
 
+    safely_extract_zip(zip_path, extracted_directory)
     chat_file = find_chat_file(extracted_directory)
-
     messages = parse_whatsapp_chat(chat_file)
 
     if not messages:
-        raise ValueError(
-            "No WhatsApp messages were found in the export."
-        )
+        raise ValueError("No WhatsApp messages were found in the export.")
 
-    archive_connection = connect_archive_database(
-        DATABASE_PATH
-    )
-
+    archive_connection = connect_archive_database(DATABASE_PATH)
     try:
         initialize_database(archive_connection)
-
         import_results = insert_messages(
             connection=archive_connection,
             messages=messages,
             property_name=cleaned_property_name,
             group_name=cleaned_property_name,
         )
-
         media_results = organize_media(
             connection=archive_connection,
             media_root=MEDIA_ROOT,
         )
-
     finally:
         archive_connection.close()
 
@@ -563,9 +505,107 @@ def import_uploaded_archive(
         "media_missing": media_results["missing"],
         "media_errors": media_results["errors"],
         "import_directory": str(import_directory),
-        "s3_object_key": s3_object_key,
+        "s3_object_key": object_key,
         "s3_size_bytes": stored_size,
+        "s3_etag": verification["etag"],
     }
+
+
+def render_direct_s3_uploader(upload_url: str, object_key: str) -> None:
+    """Render a browser uploader that sends a ZIP directly to S3."""
+    safe_url = html.escape(upload_url, quote=True)
+    safe_key = html.escape(object_key, quote=True)
+
+    components.html(
+        f"""
+        <div style="font-family:Arial,sans-serif;border:1px solid #d1d5db;
+                    border-radius:10px;padding:16px;">
+          <input id="archive-file" type="file"
+                 accept=".zip,application/zip"
+                 style="width:100%;margin-bottom:12px;" />
+          <button id="upload-button"
+                  style="width:100%;padding:10px 14px;border:0;border-radius:8px;
+                         background:#ff4b4b;color:white;font-weight:600;
+                         cursor:pointer;">
+            Upload directly to AWS S3
+          </button>
+          <div style="margin-top:12px;width:100%;background:#e5e7eb;
+                      border-radius:999px;overflow:hidden;height:14px;">
+            <div id="progress-bar"
+                 style="width:0%;height:100%;background:#16a34a;
+                        transition:width .2s;"></div>
+          </div>
+          <div id="status" style="margin-top:10px;"></div>
+          <div style="margin-top:10px;font-size:12px;color:#6b7280;
+                      overflow-wrap:anywhere;">
+            AWS object key: {safe_key}
+          </div>
+        </div>
+        <script>
+        const input = document.getElementById("archive-file");
+        const button = document.getElementById("upload-button");
+        const status = document.getElementById("status");
+        const bar = document.getElementById("progress-bar");
+
+        button.addEventListener("click", () => {{
+          const file = input.files[0];
+          if (!file) {{
+            status.textContent = "Select a ZIP file first.";
+            status.style.color = "#dc2626";
+            return;
+          }}
+          if (!file.name.toLowerCase().endsWith(".zip")) {{
+            status.textContent = "Only ZIP files are allowed.";
+            status.style.color = "#dc2626";
+            return;
+          }}
+
+          button.disabled = true;
+          status.textContent = "Uploading directly to AWS...";
+          status.style.color = "#374151";
+          bar.style.width = "0%";
+
+          const request = new XMLHttpRequest();
+          request.open("PUT", "{safe_url}", true);
+          request.setRequestHeader("Content-Type", file.type || "application/zip");
+          request.setRequestHeader("x-amz-server-side-encryption", "AES256");
+
+          request.upload.onprogress = (event) => {{
+            if (event.lengthComputable) {{
+              const percent = Math.round((event.loaded / event.total) * 100);
+              bar.style.width = percent + "%";
+              status.textContent = "Uploading directly to AWS: " + percent + "%";
+            }}
+          }};
+
+          request.onload = () => {{
+            button.disabled = false;
+            if (request.status >= 200 && request.status < 300) {{
+              bar.style.width = "100%";
+              status.textContent =
+                "Upload complete. Click 'Verify and import from AWS' below.";
+              status.style.color = "#15803d";
+            }} else {{
+              status.textContent =
+                "Upload failed. AWS returned status " + request.status + ".";
+              status.style.color = "#dc2626";
+            }}
+          }};
+
+          request.onerror = () => {{
+            button.disabled = false;
+            status.textContent =
+              "Upload failed because of a network or CORS error.";
+            status.style.color = "#dc2626";
+          }};
+
+          request.send(file);
+        }});
+        </script>
+        """,
+        height=300,
+        scrolling=False,
+    )
 
 
 # ============================================================
@@ -730,148 +770,158 @@ def display_message(message: sqlite3.Row) -> None:
 # ============================================================
 
 def show_upload_section() -> None:
-    """
-    Display the WhatsApp ZIP upload and automatic import area.
-    """
+    """Display the direct browser-to-S3 upload and import workflow."""
     with st.expander(
         "➕ Import a WhatsApp property archive",
         expanded=False,
     ):
         st.markdown(
             """
-Upload one WhatsApp ZIP export and enter the property name.
+The ZIP uploads **directly from the browser to private AWS S3 storage**.
 
-The system will automatically:
-
-- create the property archive;
-- extract the WhatsApp files;
-- import messages into the permanent database;
-- organize photos, videos and other attachments;
-- skip duplicate messages;
-- display the property on the home page.
+1. Enter the property name and the original ZIP filename.
+2. Create a temporary secure AWS upload link.
+3. Select the ZIP and upload it directly to AWS.
+4. Click **Verify and import from AWS**.
 """
         )
 
-        upload_columns = st.columns([2, 3])
-
-        with upload_columns[0]:
-            uploaded_property_name = st.text_input(
+        columns = st.columns(2)
+        with columns[0]:
+            property_name = st.text_input(
                 "Property name",
                 placeholder="Example: Opal Grand",
-                key="uploaded_property_name",
+                key="direct_property_name",
+            )
+        with columns[1]:
+            filename = st.text_input(
+                "Original ZIP filename",
+                placeholder="Example: WhatsApp Chat - Opal Grand.zip",
+                key="direct_filename",
             )
 
-        with upload_columns[1]:
-            uploaded_archive = st.file_uploader(
-                "WhatsApp ZIP export",
-                type=["zip"],
-                key="uploaded_archive",
-                help=(
-                    "Upload the ZIP containing _chat.txt "
-                    "and the exported media files."
-                ),
-            )
-
-        import_button = st.button(
-            "Import Archive",
+        if st.button(
+            "Create secure AWS upload",
             type="primary",
             use_container_width=True,
-            disabled=uploaded_archive is None,
-        )
-
-        if import_button:
-            if not uploaded_property_name.strip():
+        ):
+            if not property_name.strip():
                 st.error("Enter the property name.")
-
-            elif uploaded_archive is None:
-                st.error("Select a WhatsApp ZIP export.")
-
+            elif not filename.strip():
+                st.error("Enter the original ZIP filename.")
+            elif not filename.lower().endswith(".zip"):
+                st.error("The filename must end with .zip.")
             else:
                 try:
+                    details = create_direct_upload_url(
+                        property_name=property_name,
+                        filename=filename,
+                        content_type="application/zip",
+                        expires_in=3600,
+                    )
+                    st.session_state.direct_upload = {
+                        "property_name": property_name.strip(),
+                        "filename": filename.strip(),
+                        "object_key": details["object_key"],
+                        "upload_url": details["upload_url"],
+                    }
+                    st.success(
+                        "Secure AWS upload created. The link expires in one hour."
+                    )
+                except Exception as error:
+                    st.error(f"Could not create the AWS upload: {error}")
+
+        upload_state = st.session_state.get("direct_upload")
+
+        if upload_state:
+            st.divider()
+            st.subheader("Direct AWS upload")
+            render_direct_s3_uploader(
+                upload_url=upload_state["upload_url"],
+                object_key=upload_state["object_key"],
+            )
+
+            st.warning(
+                "Wait until the uploader says 'Upload complete' "
+                "before clicking the next button."
+            )
+
+            if st.button(
+                "Verify and import from AWS",
+                use_container_width=True,
+            ):
+                try:
                     with st.spinner(
-                        "Importing messages and organizing media..."
+                        "Verifying AWS backup, downloading and importing..."
                     ):
-                        results = import_uploaded_archive(
-                            uploaded_file=uploaded_archive,
-                            property_name=uploaded_property_name,
+                        results = import_s3_archive(
+                            object_key=upload_state["object_key"],
+                            property_name=upload_state["property_name"],
                         )
 
                     st.success(
-                        f"{results['property_name']} "
-                        "was imported successfully."
+                        f"{results['property_name']} was imported successfully."
                     )
-
                     st.success(
-                        "✅ Original WhatsApp ZIP backed up and verified in AWS S3."
+                        "✅ Original ZIP is stored and verified in AWS S3."
                     )
-
                     st.caption(
-                        f"AWS backup size: "
+                        "AWS backup size: "
                         f"{results['s3_size_bytes'] / (1024 * 1024):.2f} MB"
                     )
 
                     with st.expander("AWS backup details"):
                         st.code(results["s3_object_key"])
+                        st.write(f"ETag: {results['s3_etag']}")
 
-                    result_columns = st.columns(4)
-
-                    result_columns[0].metric(
-                        "Messages parsed",
-                        results["parsed"],
+                    metrics = st.columns(4)
+                    metrics[0].metric("Messages parsed", results["parsed"])
+                    metrics[1].metric("New messages", results["imported"])
+                    metrics[2].metric(
+                        "Duplicates skipped", results["duplicates"]
                     )
-
-                    result_columns[1].metric(
-                        "New messages",
-                        results["imported"],
-                    )
-
-                    result_columns[2].metric(
-                        "Duplicates skipped",
-                        results["duplicates"],
-                    )
-
-                    result_columns[3].metric(
-                        "Media copied",
-                        results["media_copied"],
-                    )
+                    metrics[3].metric("Media copied", results["media_copied"])
 
                     if results["media_reused"]:
                         st.info(
-                            f"{results['media_reused']} existing "
-                            "media file(s) were reused."
+                            f"{results['media_reused']} existing media file(s) "
+                            "were reused."
                         )
-
                     if results["media_missing"]:
                         st.warning(
-                            f"{results['media_missing']} referenced "
-                            "attachment(s) were not included in the ZIP."
+                            f"{results['media_missing']} referenced attachment(s) "
+                            "were not included in the ZIP."
                         )
 
                     total_errors = (
-                        results["database_errors"]
-                        + results["media_errors"]
+                        results["database_errors"] + results["media_errors"]
                     )
-
                     if total_errors:
                         st.error(
-                            f"The import completed with "
-                            f"{total_errors} error(s)."
+                            f"The import completed with {total_errors} error(s)."
+                        )
+                    else:
+                        st.success(
+                            "Backup and import verification completed."
                         )
 
-                    st.session_state.uploaded_property_name = ""
-                    st.rerun()
+                    st.session_state.pop("direct_upload", None)
 
                 except zipfile.BadZipFile:
-                    st.error(
-                        "The selected file is not a valid ZIP archive."
-                    )
-
+                    st.error("The S3 object is not a valid ZIP archive.")
                 except Exception as error:
                     st.error(f"Import failed: {error}")
 
+            if st.button(
+                "Cancel this upload",
+                use_container_width=True,
+            ):
+                st.session_state.pop("direct_upload", None)
+                st.rerun()
+
         st.caption(
-            "Do not clear the WhatsApp group until the imported "
-            "messages and media have been verified."
+            "Do not delete the WhatsApp data from the phone until the app "
+            "confirms both AWS backup verification and successful import."
         )
 
 
