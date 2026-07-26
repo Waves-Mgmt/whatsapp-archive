@@ -567,7 +567,7 @@ def render_direct_s3_uploader(upload_url: str, object_key: str) -> None:
 
           const request = new XMLHttpRequest();
           request.open("PUT", "{safe_url}", true);
-          request.setRequestHeader("Content-Type", file.type || "application/zip");
+          request.setRequestHeader("Content-Type", "application/zip");
           request.setRequestHeader("x-amz-server-side-encryption", "AES256");
 
           request.upload.onprogress = (event) => {{
