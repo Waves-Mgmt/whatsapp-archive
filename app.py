@@ -19,6 +19,8 @@ import streamlit.components.v1 as components
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+# The database is stored in S3 and pulled into container-local scratch space
+# on demand. The container's disk is disposable; the bucket is not.
 DATABASE_PATH = PROJECT_ROOT / "database" / "operations_archive.db"
 MEDIA_ROOT = PROJECT_ROOT / "media"
 INCOMING_ROOT = PROJECT_ROOT / "incoming"
@@ -38,6 +40,19 @@ from s3_direct_upload import (  # noqa: E402
     create_direct_upload_url,
     download_s3_object,
     verify_uploaded_object,
+)
+import archive_store  # noqa: E402
+from archive_store import (  # noqa: E402
+    count_pending_media,
+    is_s3_media,
+    key_from_media_uri,
+    presigned_media_url,
+)
+from s3_import import (  # noqa: E402
+    import_archive_messages,
+    list_known_properties,
+    list_property_archives,
+    process_media_batch,
 )
 
 
@@ -77,13 +92,45 @@ MONTH_NAMES = {
 # Database reading functions
 # ============================================================
 
+@st.cache_resource(show_spinner="Loading the archive...")
+def ensure_local_database() -> str:
+    """
+    Make sure this container has a copy of the archive database.
+
+    Downloaded from S3 once per container and reused afterwards. Cached so a
+    page navigation does not re-download it.
+    """
+    path = archive_store.pull_database()
+
+    if not path.exists():
+        # First run against an empty bucket: create the schema locally so the
+        # browsing pages render an empty archive instead of erroring.
+        connection = connect_archive_database(path)
+        try:
+            initialize_database(connection)
+        finally:
+            connection.close()
+
+    return str(path)
+
+
+def refresh_local_database() -> None:
+    """Forget the cached copy so the next read pulls from S3 again."""
+    ensure_local_database.clear()
+
+
 def connect_view_database() -> sqlite3.Connection:
     """
-    Open the permanent SQLite archive for reading.
+    Open the archive for reading, fetching it from S3 if needed.
     """
-    connection = sqlite3.connect(DATABASE_PATH)
+    connection = sqlite3.connect(ensure_local_database())
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def connect_write_database() -> sqlite3.Connection:
+    """Open the archive for writing. Callers must push_database() after."""
+    return connect_archive_database(Path(ensure_local_database()))
 
 
 def get_properties(search_text: str = "") -> list[str]:
@@ -713,29 +760,47 @@ def display_media(message: sqlite3.Row) -> None:
         )
         return
 
-    file_path = Path(media_path)
-
-    if not file_path.exists():
-        st.warning(
-            f"Archived file not found: {attachment_filename}"
+    if str(media_path).startswith("missing://"):
+        st.caption(
+            f"📎 {attachment_filename} — referenced in the chat but not "
+            "included in the export."
         )
         return
+
+    if is_s3_media(media_path):
+        # Stored in S3. The bucket stays private; the browser gets a
+        # short-lived signed link that expires on its own.
+        try:
+            source = presigned_media_url(key_from_media_uri(media_path))
+        except Exception as error:
+            st.warning(f"Could not load {attachment_filename}: {error}")
+            return
+    else:
+        file_path = Path(media_path)
+
+        if not file_path.exists():
+            st.warning(
+                f"Archived file not found: {attachment_filename}"
+            )
+            return
+
+        source = str(file_path)
 
     if media_type == "photo":
         with st.expander("📷 View photo"):
             st.image(
-                str(file_path),
+                source,
                 caption=attachment_filename,
                 use_container_width=True,
             )
 
     elif media_type == "video":
         with st.expander("🎥 View video"):
-            st.video(str(file_path))
+            st.video(source)
 
     elif media_type == "audio":
         with st.expander("🔊 Play audio"):
-            st.audio(str(file_path))
+            st.audio(source)
 
     elif media_type == "document":
         st.markdown(
@@ -764,6 +829,233 @@ def display_message(message: sqlite3.Row) -> None:
             st.write(message_text)
 
         display_media(message)
+
+
+
+# ============================================================
+# Import an archive that is already in S3
+# ============================================================
+
+def format_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:,.1f} {unit}" if unit != "B" else f"{size:,.0f} B"
+        size /= 1024
+    return f"{size:,.1f} TB"
+
+
+def show_media_progress_panel() -> None:
+    """
+    Photos still waiting to be copied into S3, and the button that does it.
+
+    Kept separate from the import itself so a very large archive can be
+    processed in slices. Progress lives in the database, so closing the tab
+    or a Streamlit restart costs nothing.
+    """
+    connection = connect_view_database()
+    try:
+        pending = count_pending_media(connection)
+    except sqlite3.Error:
+        pending = 0
+    finally:
+        connection.close()
+
+    if not pending:
+        return
+
+    st.divider()
+    st.subheader("Photos waiting to be archived")
+    st.write(
+        f"**{pending:,}** attachment(s) have been indexed but not yet copied "
+        "into S3. Messages are already browsable; photos appear as they are "
+        "copied."
+    )
+    st.caption(
+        "This can be run in stages. If you close the tab, nothing is lost — "
+        "click again later and it resumes where it stopped."
+    )
+
+    batch_size = st.select_slider(
+        "Photos to process now",
+        options=[50, 100, 250, 500, 1000],
+        value=250,
+        key="media_batch_size",
+    )
+
+    if st.button(
+        f"Copy the next {batch_size} photo(s) into S3",
+        type="primary",
+        use_container_width=True,
+    ):
+        progress = st.progress(0.0, text="Starting...")
+
+        def report(done: int, total: int) -> None:
+            progress.progress(
+                min(done / max(total, 1), 1.0),
+                text=f"Copying photo {done:,} of {total:,}...",
+            )
+
+        try:
+            with st.spinner("Streaming photos from the archive into S3..."):
+                connection = connect_write_database()
+                try:
+                    results = process_media_batch(
+                        connection=connection,
+                        limit=batch_size,
+                        progress_callback=report,
+                    )
+                finally:
+                    connection.close()
+
+                archive_store.push_database()
+
+            progress.empty()
+            refresh_local_database()
+
+            st.success(f"{results['copied']:,} photo(s) copied into S3.")
+            if results["missing"]:
+                st.info(
+                    f"{results['missing']:,} attachment(s) were referenced in "
+                    "the chat but not included in the export."
+                )
+            if results["errors"]:
+                st.warning(f"{results['errors']:,} file(s) could not be copied.")
+
+            st.rerun()
+
+        except Exception as error:
+            progress.empty()
+            st.error(f"Could not copy photos: {error}")
+
+
+def show_s3_import_section() -> None:
+    """Import an archive that is already sitting in the S3 bucket."""
+    with st.expander("📦 Import an archive already in S3", expanded=False):
+        st.markdown(
+            """
+Use this for archives that are too large to upload through the browser.
+Put the ZIP in the bucket with the AWS CLI or the S3 console, then import it
+here. **The archive is never downloaded** — only the chat transcript is read,
+and photos are copied straight from the archive into S3.
+"""
+        )
+
+        try:
+            known_properties = list_known_properties()
+        except Exception as error:
+            st.error(f"Could not read the S3 bucket: {error}")
+            return
+
+        if not known_properties:
+            st.info("No property folders were found in the bucket yet.")
+            return
+
+        columns = st.columns([2, 3])
+
+        with columns[0]:
+            folder = st.selectbox(
+                "Property folder in S3",
+                options=known_properties,
+                key="s3_import_folder",
+            )
+
+        try:
+            archives = list_property_archives(folder)
+        except Exception as error:
+            st.error(f"Could not list archives: {error}")
+            return
+
+        if not archives:
+            st.info(f"No ZIP archives found under `properties/{folder}/`.")
+            return
+
+        with columns[1]:
+            choice = st.selectbox(
+                "Archive",
+                options=archives,
+                format_func=lambda item: (
+                    f"{item['filename']}  ·  {format_size(item['size_bytes'])}"
+                    f"  ·  {item['last_modified']:%d %b %Y}"
+                ),
+                key="s3_import_archive",
+            )
+
+        display_name = st.text_input(
+            "Property name to file these messages under",
+            value=folder.replace("-", " ").title(),
+            help=(
+                "This is the name shown on the property tile. Keep it "
+                "identical for every import of the same hotel, or they will "
+                "appear as two separate properties."
+            ),
+            key="s3_import_property_name",
+        )
+
+        st.caption(f"Object key: `{choice['key']}`")
+
+        if st.button(
+            "Import messages from this archive",
+            type="primary",
+            use_container_width=True,
+        ):
+            if not display_name.strip():
+                st.error("Enter the property name.")
+            else:
+                try:
+                    with st.spinner(
+                        "Reading the transcript directly from S3..."
+                    ):
+                        connection = connect_write_database()
+                        try:
+                            results = import_archive_messages(
+                                connection=connection,
+                                object_key=choice["key"],
+                                property_name=display_name,
+                            )
+                        finally:
+                            connection.close()
+
+                        archive_store.push_database()
+
+                    refresh_local_database()
+
+                    st.success(
+                        f"{results['property_name']} imported successfully."
+                    )
+
+                    metrics = st.columns(4)
+                    metrics[0].metric("Messages parsed", f"{results['parsed']:,}")
+                    metrics[1].metric("New messages", f"{results['imported']:,}")
+                    metrics[2].metric(
+                        "Duplicates skipped", f"{results['duplicates']:,}"
+                    )
+                    metrics[3].metric(
+                        "Photos found", f"{results['attachments_present']:,}"
+                    )
+
+                    st.info(
+                        "Read "
+                        f"**{format_size(results['bytes_read'])}** of a "
+                        f"**{format_size(results['archive_size_bytes'])}** "
+                        "archive to do this — the ZIP was never downloaded."
+                    )
+
+                    if results["attachments_missing"]:
+                        st.warning(
+                            f"{results['attachments_missing']:,} attachment(s) "
+                            "are referenced in the chat but not included in "
+                            "the export file."
+                        )
+
+                    st.rerun()
+
+                except zipfile.BadZipFile:
+                    st.error("That S3 object is not a valid ZIP archive.")
+                except Exception as error:
+                    st.error(f"Import failed: {error}")
+
+        show_media_progress_panel()
 
 
 # ============================================================
@@ -937,6 +1229,7 @@ def show_properties_page() -> None:
         "Select a property to review its archived daily operations."
     )
 
+    show_s3_import_section()
     show_upload_section()
 
     st.divider()

@@ -12,7 +12,8 @@ MESSAGE_PATTERN = re.compile(
 )
 
 SENDER_PATTERN = re.compile(
-    r"^(?P<sender>[^:]+):\s?(?P<message>.*)$"
+    r"^(?P<sender>[^:]+):\s?(?P<message>.*)$",
+    flags=re.DOTALL,
 )
 
 ATTACHMENT_PATTERN = re.compile(
@@ -278,6 +279,62 @@ def create_message_record(
     )
 
 
+def parse_whatsapp_chat_lines(
+    lines,
+    source_file,
+) -> list[WhatsAppMessage]:
+    """
+    Parse an iterable of raw export lines.
+
+    This is the shared core. parse_whatsapp_chat() feeds it a file on disk;
+    parse_whatsapp_chat_text() feeds it a transcript read straight out of a
+    ZIP in S3. Both take exactly the same code path, so results are identical.
+    """
+    messages: list[WhatsAppMessage] = []
+
+    current_timestamp: Optional[str] = None
+    current_content_lines: list[str] = []
+
+    def flush() -> None:
+        if current_timestamp is not None and current_content_lines:
+            messages.append(
+                create_message_record(
+                    timestamp_text=current_timestamp,
+                    content="\n".join(current_content_lines),
+                    source_file=source_file,
+                )
+            )
+
+    for raw_line in lines:
+        line = normalize_export_line(raw_line)
+        message_match = MESSAGE_PATTERN.match(line)
+
+        if message_match:
+            flush()
+            current_timestamp = message_match.group("timestamp").strip()
+            current_content_lines = [message_match.group("content")]
+        elif current_timestamp is not None:
+            current_content_lines.append(line)
+
+    flush()
+
+    return messages
+
+
+def parse_whatsapp_chat_text(
+    chat_text: str,
+    source_file: str = "unknown",
+) -> list[WhatsAppMessage]:
+    """
+    Parse a transcript already held as text -- for archives read directly
+    from S3, where the ZIP is never written to disk.
+    """
+    return parse_whatsapp_chat_lines(
+        chat_text.splitlines(),
+        source_file=source_file,
+    )
+
+
 def parse_whatsapp_chat(
     chat_file: Path,
 ) -> list[WhatsAppMessage]:
@@ -306,65 +363,12 @@ def parse_whatsapp_chat(
             f"Chat path is not a file: {chat_file}"
         )
 
-    messages: list[WhatsAppMessage] = []
-
-    current_timestamp: Optional[str] = None
-    current_content_lines: list[str] = []
-
     with chat_file.open(
         "r",
         encoding="utf-8-sig",
         errors="replace",
     ) as file:
-        for raw_line in file:
-            line = normalize_export_line(raw_line)
-
-            message_match = MESSAGE_PATTERN.match(line)
-
-            if message_match:
-                if (
-                    current_timestamp is not None
-                    and current_content_lines
-                ):
-                    combined_content = "\n".join(
-                        current_content_lines
-                    )
-
-                    message_record = create_message_record(
-                        timestamp_text=current_timestamp,
-                        content=combined_content,
-                        source_file=chat_file,
-                    )
-
-                    messages.append(message_record)
-
-                current_timestamp = message_match.group(
-                    "timestamp"
-                ).strip()
-
-                current_content_lines = [
-                    message_match.group(
-                        "content"
-                    )
-                ]
-
-            elif current_timestamp is not None:
-                current_content_lines.append(line)
-
-        if (
-            current_timestamp is not None
-            and current_content_lines
-        ):
-            combined_content = "\n".join(
-                current_content_lines
-            )
-
-            message_record = create_message_record(
-                timestamp_text=current_timestamp,
-                content=combined_content,
-                source_file=chat_file,
-            )
-
-            messages.append(message_record)
-
-    return messages
+        return parse_whatsapp_chat_lines(
+            file,
+            source_file=chat_file,
+        )
